@@ -57,7 +57,7 @@ def test_aggregate_by_date_month():
 
 
 def test_aggregate_by_date_day():
-    g = aggregate_by_date(ALL, "created_at", "day", include_items=True)
+    g = aggregate_by_date(ALL, "created_at", "day", include_items=True, max_agg_chars=10_000_000)
     counts_in = Counter(
         f"{_dt_created(it).year:04d}-{_dt_created(it).month:02d}-{_dt_created(it).day:02d}"
         for it in ALL

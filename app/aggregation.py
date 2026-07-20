@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Literal
@@ -8,6 +9,73 @@ from app.schemas import AggregationResult, IssueDetail
 
 Granularity = Literal["year", "quarter", "month", "week", "day", "hour"]
 GRANULARITIES: tuple[str, ...] = ("year", "quarter", "month", "week", "day", "hour")
+
+# ≈ 40k tokens。聚合结果超过此字符数时自动删除 items 明细等大字段做降级，避免 10000+ 条数据撑爆 LLM context。
+# 10000 条按小时聚合大约 1000 组 × 每组 ~80 chars (无 items) ≈ 80k chars，此阈值刚好容纳。
+MAX_AGG_JSON_CHARS = 80000
+
+
+def _json_len(o: Any) -> int:
+    try:
+        return len(json.dumps(o, ensure_ascii=False))
+    except Exception:  # noqa: BLE001
+        return 2**31
+
+
+def _strip_items_deep(o: Any) -> Any:
+    if isinstance(o, dict):
+        out: dict[str, Any] = {}
+        for k, v in o.items():
+            if k == "items":
+                count = len(v) if isinstance(v, list) else None
+                note = "removed items to reduce context size"
+                if count is not None:
+                    note = f"removed {count} items to reduce context size"
+                out["items_note"] = note
+                continue
+            out[k] = _strip_items_deep(v)
+        return out
+    if isinstance(o, list):
+        return [_strip_items_deep(x) for x in o]
+    return o
+
+
+def _sum_group_counts(groups: list[Any]) -> int:
+    total = 0
+    for g in groups:
+        try:
+            total += int(g.get("count", 0) if isinstance(g, dict) else 0)
+        except Exception:  # noqa: BLE001
+            pass
+    return total
+
+
+def _cap_aggregation_output(result: Any, max_chars: int = MAX_AGG_JSON_CHARS) -> Any:
+    """兜底：聚合结果 JSON 太大时先深度删除 items 明细，若仍超长则截断组列表。"""
+    if _json_len(result) <= max_chars:
+        return result
+    stripped = _strip_items_deep(result)
+    if _json_len(stripped) <= max_chars:
+        return stripped
+    if isinstance(stripped, list):
+        kept: list[Any] = []
+        dropped: list[Any] = []
+        for g in stripped:
+            if _json_len(kept + [g]) <= max_chars:
+                kept.append(g)
+            else:
+                dropped.append(g)
+        if dropped:
+            dropped_records = _sum_group_counts(dropped)
+            kept.append({
+                "group_key": "__TRUNCATED__",
+                "count": dropped_records,
+                "groups_dropped": len(dropped),
+                "note": (f"{len(dropped)} groups ({dropped_records} records) trimmed "
+                         f"to fit context size limit ({max_chars} chars)"),
+            })
+        return kept
+    return stripped
 
 
 def _as_dict(it: Any) -> dict[str, Any]:
@@ -41,11 +109,16 @@ def _get(it: Any, field: str) -> Any:
 def aggregate_by_field(
     items: list[Any],
     field: str,
-    include_items: bool = True,
-    max_items_per_group: int = 100,
+    include_items: bool = False,
+    max_items_per_group: int = 20,
+    max_agg_chars: int = MAX_AGG_JSON_CHARS,
 ) -> list[dict[str, Any]]:
     """按指定字段分组聚合，远程接口不支持此能力，需在应用层实现。
     常用字段: status/priority/category/severity/creator/assignee/project/module/environment/fault_component/version
+
+    注意：include_items 默认 False，避免明细把 LLM context 撑爆。若确需样本可显式传 True，
+    此时 max_items_per_group 默认限制为 20（仍会经过 _cap_aggregation_output 全局兜底强制裁剪超长结果，
+    可通过 max_agg_chars 上调阈值，例如 unit test 中需要断言 items 时传大值）。
     """
     groups: dict[str, list[Any]] = defaultdict(list)
     for it in items:
@@ -68,7 +141,7 @@ def aggregate_by_field(
             safe_items: list[dict[str, Any]] = [_as_dict(x) for x in group_items[:max_items_per_group]]
             entry["items"] = safe_items
         result.append(entry)
-    return result
+    return _cap_aggregation_output(result, max_chars=max_agg_chars)
 
 
 def aggregate_two_level(
@@ -77,11 +150,13 @@ def aggregate_two_level(
     field2: str,
 ) -> list[dict[str, Any]]:
     """双层分组（如先按项目，再按状态），客户端聚合典型场景。"""
-    first = aggregate_by_field(items, field1, include_items=True, max_items_per_group=10000)
+    first = aggregate_by_field(items, field1, include_items=True,
+                               max_items_per_group=len(items),
+                               max_agg_chars=10**9)  # 二级聚合内部调用，先不做 cap，由最终返回统一处理
     result = []
     for g in first:
         nested = []
-        for x in g["items"]:
+        for x in g.get("items") or []:
             nested.append(x if isinstance(x, dict) else _as_dict(x))
         sub = aggregate_by_field(nested, field2, include_items=False)
         result.append({
@@ -89,7 +164,7 @@ def aggregate_two_level(
             "count": g["count"],
             "sub_groups": sub,
         })
-    return result
+    return _cap_aggregation_output(result)
 
 
 def stat_summary(
@@ -117,7 +192,7 @@ def stat_summary(
     total_votes = _sum_field("votes_count")
     total_watchers = _sum_field("watchers_count")
 
-    return {
+    result = {
         "total": total,
         "by_status": by_status,
         "by_priority": by_priority,
@@ -129,11 +204,12 @@ def stat_summary(
         "sum_watchers_count": total_watchers,
         "avg_comments_per_issue": round(total_comments / total, 2) if total else 0,
     }
+    return _cap_aggregation_output(result, max_chars=MAX_AGG_JSON_CHARS)
 
 
 # ------------------------- 时间维度聚合（按年/季/月/周/日/小时） -------------------------
 
-def _parse_dt(v: Any) -> Optional[datetime]:
+def _parse_dt(v: Any) -> Any | None:
     if v is None:
         return None
     if isinstance(v, datetime):
@@ -177,8 +253,9 @@ def aggregate_by_date(
     items: list[Any],
     date_field: str = "created_at",
     granularity: Granularity = "month",
-    include_items: bool = True,
-    max_items_per_group: int = 100,
+    include_items: bool = False,
+    max_items_per_group: int = 20,
+    max_agg_chars: int = MAX_AGG_JSON_CHARS,
 ) -> list[dict[str, Any]]:
     """按时间粒度聚合（远程接口不支持按 date_part 分组，需本地计算）。
 
@@ -186,8 +263,9 @@ def aggregate_by_date(
         items: 问题单列表（dict 或 IssueDetail 对象均可）
         date_field: 用于聚合的时间字段，如 created_at / updated_at / resolved_at / due_date
         granularity: year / quarter / month / week / day / hour
-        include_items: 是否将明细 records 塞进每组 items
-        max_items_per_group: 每组最多保留多少条明细
+        include_items: 是否将明细 records 塞进每组 items。默认 False，避免 10000+ 条按日分组时 180 天×20 条仍可能超长（有 _cap_aggregation_output 兜底）
+        max_items_per_group: 每组最多保留多少条明细（仅当 include_items=True 时生效）
+        max_agg_chars: 结果 JSON 字符阈值，超过会自动降级裁剪（unit test 可上调）
     """
     if granularity not in GRANULARITIES:
         raise ValueError(
@@ -231,7 +309,7 @@ def aggregate_by_date(
         if include_items:
             entry["items"] = [_as_dict(x) for x in empties[:max_items_per_group]]
         result.append(entry)
-    return result
+    return _cap_aggregation_output(result, max_chars=max_agg_chars)
 
 
 def aggregate_date_and_field(
@@ -239,10 +317,13 @@ def aggregate_date_and_field(
     date_field: str = "created_at",
     granularity: Granularity = "month",
     second_field: str = "status",
+    max_agg_chars: int = MAX_AGG_JSON_CHARS,
 ) -> list[dict[str, Any]]:
     """时间 + 维度的双层交叉聚合（例如：每月按状态分组）。"""
+    n = len(items) if isinstance(items, list) else 1000000
     first = aggregate_by_date(items, date_field=date_field, granularity=granularity,
-                              include_items=True, max_items_per_group=1000000)
+                              include_items=True, max_items_per_group=n,
+                              max_agg_chars=10**9)  # 中间态不 cap，交给最终 cap
     result: list[dict[str, Any]] = []
     for g in first:
         nested = g.get("items") or []
@@ -254,16 +335,16 @@ def aggregate_date_and_field(
             "count": g["count"],
             "breakdown_by_" + second_field: sub,
         })
-    return result
+    return _cap_aggregation_output(result, max_chars=max_agg_chars)
 
 
 AGGREGATE_HELP = """
 可用的客户端聚合操作（远程接口无法实现，需本地计算）：
-1. aggregate_by_field(items, field) - 按单字段分组计数，可选字段：
+1. aggregate_by_field(items, field, include_items=False) - 按单字段分组计数，可选字段：
    status/priority/category/severity/creator/assignee/project/module/environment/fault_component/version
 2. aggregate_two_level(items, field1, field2) - 双层分组，如先按project再按status
 3. stat_summary(items) - 综合统计概览：总数、各维度分布、评论/投票/关注数求和及均值
-4. aggregate_by_date(items, date_field, granularity) - 按时间粒度聚合（远程接口无 date_part 能力）：
+4. aggregate_by_date(items, date_field, granularity, include_items=False) - 按时间粒度聚合（远程接口无 date_part 能力）：
    date_field ∈ {created_at, updated_at, resolved_at, due_date}
    granularity ∈ {year, quarter, month, week, day, hour}
    例：按创建年 aggregate_by_date(items, 'created_at', 'year')
@@ -271,4 +352,5 @@ AGGREGATE_HELP = """
        按更新日 aggregate_by_date(items, 'updated_at', 'day')
 5. aggregate_date_and_field(items, date_field, granularity, second_field) - 时间 × 维度交叉：
    例：每月按状态 aggregate_date_and_field(items, 'created_at', 'month', 'status')
+所有聚合结果最终都会经过 MAX_AGG_JSON_CHARS≈20000 chars 兜底裁剪（删除 items 明细 / 截断尾部 groups），避免 10000+ 条数据把 LLM context 撑爆。
 """

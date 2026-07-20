@@ -288,9 +288,72 @@ def node_tools(state: AgentState) -> AgentState:
     new_msgs.extend(tool_msgs)
 
     if aggregated is not None:
+        # 第二层兜底：即使 aggregation 已做 cap，这里再强制做一次上下文安全裁剪，避免 10000+ 条数据撑爆 LLM prompt。
+        # 与 aggregation.MAX_AGG_JSON_CHARS 保持一致（无缩进字符数）。
+        PROMPT_JSON_SAFE_CHARS = 80000  # ≈ 40k tokens，给 system/history 留出 ~30% 空间
+        safe = aggregated
+        raw_chars = len(json.dumps(safe, ensure_ascii=False))
+        if raw_chars > PROMPT_JSON_SAFE_CHARS:
+            # 第一步：深度删除所有 items 明细
+            def _strip_items(o: Any) -> Any:
+                if isinstance(o, dict):
+                    return {k: _strip_items(v) for k, v in o.items() if k != "items"}
+                if isinstance(o, list):
+                    return [_strip_items(x) for x in o]
+                return o
+            safe = _strip_items(safe)
+            stripped_chars = len(json.dumps(safe, ensure_ascii=False))
+            if stripped_chars > PROMPT_JSON_SAFE_CHARS and isinstance(safe, list):
+                # 第二步：仍超长则截断顶层 groups 列表，保留按 count 降序/原顺序的前面几组
+                kept: list[Any] = []
+                dropped: list[Any] = []
+                for g in safe:
+                    trial = kept + [g]
+                    if len(json.dumps(trial, ensure_ascii=False)) <= PROMPT_JSON_SAFE_CHARS:
+                        kept.append(g)
+                    else:
+                        dropped.append(g)
+                if dropped:
+                    try:
+                        dropped_records = sum(
+                            int(x.get("count", 0)) for x in dropped if isinstance(x, dict)
+                        )
+                    except Exception:  # noqa: BLE001
+                        dropped_records = 0
+                    kept.append({
+                        "group_key": "__TRUNCATED__",
+                        "count": dropped_records,
+                        "groups_dropped": len(dropped),
+                        "note": (f"{len(dropped)} groups ({dropped_records} records) trimmed "
+                                 f"to fit LLM prompt size ({PROMPT_JSON_SAFE_CHARS} chars)"),
+                    })
+                    safe = kept
+            final_chars = len(json.dumps(safe, ensure_ascii=False))
+            # 第三步：极端兜底——如果顶层 groups 截断后还是过长（例如交叉聚合 breakdown 太大），
+            # 就返回一个仅包含 record count 汇总 + note 的极简结果。
+            if final_chars > PROMPT_JSON_SAFE_CHARS:
+                try:
+                    records = 0
+                    groups_total = 0
+                    for g in safe if isinstance(safe, list) else []:
+                        if isinstance(g, dict):
+                            records += int(g.get("count", 0) or 0)
+                            groups_total += 1
+                except Exception:  # noqa: BLE001
+                    records = 0
+                    groups_total = 0
+                safe = [{
+                    "group_key": "__SUMMARIZED__",
+                    "count": records,
+                    "groups": groups_total,
+                    "note": (f"Aggregation too large (> {PROMPT_JSON_SAFE_CHARS} chars). "
+                             "Count-only summary returned. Please narrow the filter (e.g. by date range) "
+                             "to obtain a full breakdown."),
+                }]
+        aggregated_json = json.dumps(safe, ensure_ascii=False, indent=2)
         extra_msg = HumanMessage(
             content="[本地聚合结果(远程接口不支持分组/统计，请基于此结果给用户结论，用markdown表格)]\n"
-            + json.dumps(aggregated, ensure_ascii=False, indent=2)
+            + aggregated_json
         )
         new_msgs.append(extra_msg)
 
